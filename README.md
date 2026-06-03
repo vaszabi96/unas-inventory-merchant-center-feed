@@ -1,3 +1,8 @@
+## Aktív Merchant Center feed URL
+
+```text
+https://vaszabi96.github.io/unas-inventory-merchant-center-feed/product_database_raw.txt
+
 # UNAS Inventory → Google Merchant Center feed
 
 Ez a repository egy automatikus termék- és készletfeed-generátort tartalmaz.
