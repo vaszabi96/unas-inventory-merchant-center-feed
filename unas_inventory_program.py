@@ -1,73 +1,169 @@
+from __future__ import annotations
+
+import logging
 import os
-import requests
-import xml.etree.ElementTree as ET
 import sys
-import pandas as pd
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from datetime import date, datetime, time
 from io import BytesIO
+from pathlib import Path
+from typing import Final
+from zoneinfo import ZoneInfo
 
-base_path = os.environ.get("OUTPUT_DIR", "public")
-os.makedirs(base_path, exist_ok=True)
+import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# ── Beállítás: szorozzuk-e az árat a min. mennyiséggel? ─────────
-MULTIPLY_BY_MIN_QTY = 0  # 1 = IGEN (szoroz), 0 = NEM (nem szoroz)
+
 # ────────────────────────────────────────────────────────────────
+# Alapbeállítások
+# ────────────────────────────────────────────────────────────────
+BASE_URL: Final[str] = "https://api.unas.eu/shop"
+LOGIN_URL: Final[str] = f"{BASE_URL}/login"
+PRODUCTDB_URL: Final[str] = f"{BASE_URL}/getProductDB"
+BUDAPEST_TZ: Final[ZoneInfo] = ZoneInfo("Europe/Budapest")
 
-# ── Konfiguráció ─────────────────────────────────────────────
-API_KEY = os.environ.get("UNAS_API_KEY")
+DEFAULT_STORE_CODE: Final[str] = "03343192712828716513"
+DEFAULT_OUTPUT_DIR: Final[str] = "public"
+DEFAULT_TXT_FILENAME: Final[str] = "product_database_raw.txt"
+DEFAULT_XLSX_FILENAME: Final[str] = "product_database_raw.xlsx"
 
-if not API_KEY:
-    raise RuntimeError("Hiányzik az UNAS_API_KEY környezeti változó.")
-BASE_URL      = "https://api.unas.eu/shop"
-LOGIN_URL     = f"{BASE_URL}/login"
-PRODUCTDB_URL = f"{BASE_URL}/getProductDB"
-# ─────────────────────────────────────────────────────────────
+REQUIRED_COLUMNS: Final[set[str]] = {
+    "Cikkszám",
+    "Státusz",
+    "Raktárkészlet",
+    "Min. Menny.",
+    "Bruttó Ár",
+    "Akciós Bruttó Ár",
+    "Akció Kezdet",
+    "Akció Lejárat",
+}
 
-def get_token():
+OUTPUT_COLUMNS: Final[list[str]] = [
+    "id",
+    "price",
+    "sale_price",
+    "quantity",
+    "store_code",
+    "availability",
+    "pickup_method",
+    "pickup_sla",
+    "sale_price_effective_date",
+]
+
+
+@dataclass(frozen=True)
+class Config:
+    unas_api_key: str
+    output_dir: Path
+    store_code: str
+    multiply_by_min_qty: bool
+    write_debug_xlsx: bool
+    txt_filename: str = DEFAULT_TXT_FILENAME
+    xlsx_filename: str = DEFAULT_XLSX_FILENAME
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    """Környezeti változó értelmezése logikai értékként."""
+    raw_value = os.environ.get(name)
+
+    if raw_value is None:
+        return default
+
+    return raw_value.strip().lower() in {"1", "true", "yes", "y", "igen", "i"}
+
+
+def load_config() -> Config:
+    unas_api_key = os.environ.get("UNAS_API_KEY", "").strip()
+
+    if not unas_api_key:
+        raise RuntimeError("Hiányzik az UNAS_API_KEY környezeti változó.")
+
+    output_dir = Path(os.environ.get("OUTPUT_DIR", DEFAULT_OUTPUT_DIR)).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    return Config(
+        unas_api_key=unas_api_key,
+        output_dir=output_dir,
+        store_code=os.environ.get("GOOGLE_STORE_CODE", DEFAULT_STORE_CODE).strip() or DEFAULT_STORE_CODE,
+        multiply_by_min_qty=env_bool("MULTIPLY_BY_MIN_QTY", default=False),
+        write_debug_xlsx=env_bool("WRITE_DEBUG_XLSX", default=False),
+    )
+
+
+def build_http_session() -> requests.Session:
+    """HTTP kliens automatikus újrapróbálással átmeneti hibákra."""
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=2,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST"}),
+        raise_on_status=False,
+    )
+
+    adapter = HTTPAdapter(max_retries=retry)
+
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def parse_xml_field(xml_content: bytes, field_name: str, context: str) -> str:
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError as exc:
+        raise RuntimeError(f"{context}: az UNAS válasza nem érvényes XML.") from exc
+
+    value = root.findtext(field_name)
+
+    if not value:
+        raise RuntimeError(f"{context}: hiányzik a <{field_name}> mező az UNAS válaszból.")
+
+    return value.strip()
+
+
+def raise_for_status_with_body(response: requests.Response, context: str) -> None:
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        body_preview = response.text[:800].replace("\n", " ")
+        raise RuntimeError(
+            f"{context}: HTTP hiba. status={response.status_code}, response={body_preview}"
+        ) from exc
+
+
+def get_token(session: requests.Session, config: Config) -> str:
     xml = f"""
 <Request>
-  <ApiKey>{API_KEY}</ApiKey>
+  <ApiKey>{config.unas_api_key}</ApiKey>
   <WebshopInfo>true</WebshopInfo>
 </Request>
-"""
+""".strip()
+
     headers = {
         "Content-Type": "application/xml",
-        "Accept": "application/xml"
+        "Accept": "application/xml",
     }
-    resp = requests.post(LOGIN_URL, data=xml.encode('utf-8'), headers=headers)
-    resp.raise_for_status()
-    token = ET.fromstring(resp.content).findtext("Token")
-    if not token:
-        print("Nincs token.")
-        sys.exit(1)
-    return token
 
-def convert_sale_date(start, end, sale_price):
-    try:
-        if pd.to_numeric(sale_price, errors='coerce') > 0:
-            today = pd.Timestamp.today().normalize()
+    response = session.post(
+        LOGIN_URL,
+        data=xml.encode("utf-8"),
+        headers=headers,
+        timeout=60,
+    )
 
-            try:
-                start_dt = pd.to_datetime(start) if pd.notna(start) else today
-            except:
-                start_dt = today
+    raise_for_status_with_body(response, "UNAS login")
+    return parse_xml_field(response.content, "Token", "UNAS login")
 
-            if pd.notna(end):
-                try:
-                    end_dt = pd.to_datetime(end)
-                except:
-                    end_dt = today + pd.DateOffset(years=1)
-            else:
-                end_dt = today + pd.DateOffset(years=1)
 
-            start_str = start_dt.strftime('%Y-%m-%dT00:00+0100')
-            end_str = end_dt.strftime('%Y-%m-%dT00:00+0100')
-            return f"{start_str}/{end_str}"
-    except:
-        pass
-    return ""
-
-def download_product_db(token):
-    xml = f"""
+def request_product_db_url(session: requests.Session, token: str) -> str:
+    xml = """
 <Request>
   <Format>xlsx</Format>
   <Compress>no</Compress>
@@ -77,84 +173,221 @@ def download_product_db(token):
   <GetPriceSale>1</GetPriceSale>
   <GetMinQty>1</GetMinQty>
 </Request>
-"""
+""".strip()
+
     headers = {
         "Content-Type": "application/xml",
         "Accept": "application/xml",
-        "Authorization": f"Bearer {token}"
+        "Authorization": f"Bearer {token}",
     }
-    resp = requests.post(PRODUCTDB_URL, data=xml.encode('utf-8'), headers=headers)
-    resp.raise_for_status()
-    url = ET.fromstring(resp.content).findtext("Url")
-    if not url:
-        print("Nincs letöltési URL.")
-        sys.exit(1)
 
-    file_resp = requests.get(url)
-    file_resp.raise_for_status()
-    excel_data = BytesIO(file_resp.content)
+    response = session.post(
+        PRODUCTDB_URL,
+        data=xml.encode("utf-8"),
+        headers=headers,
+        timeout=60,
+    )
+
+    raise_for_status_with_body(response, "UNAS termékadatbázis URL lekérése")
+    return parse_xml_field(response.content, "Url", "UNAS termékadatbázis URL lekérése")
+
+
+def download_excel(session: requests.Session, download_url: str) -> BytesIO:
+    response = session.get(download_url, timeout=180)
+    raise_for_status_with_body(response, "UNAS XLSX letöltése")
+
+    if not response.content:
+        raise RuntimeError("UNAS XLSX letöltése: üres fájlt kaptunk.")
+
+    return BytesIO(response.content)
+
+
+def parse_date_or_default(value: object, fallback: date) -> date:
+    if value is None or pd.isna(value) or str(value).strip() == "":
+        return fallback
+
+    parsed = pd.to_datetime(value, errors="coerce")
+
+    if pd.isna(parsed):
+        return fallback
+
+    return parsed.date()
+
+
+def format_merchant_datetime(value: date) -> str:
+    local_midnight = datetime.combine(value, time.min, tzinfo=BUDAPEST_TZ)
+    return local_midnight.strftime("%Y-%m-%dT%H:%M%z")
+
+
+def convert_sale_date(start: object, end: object, sale_price: object) -> str:
+    sale_price_numeric = pd.to_numeric(sale_price, errors="coerce")
+
+    if pd.isna(sale_price_numeric) or float(sale_price_numeric) <= 0:
+        return ""
+
+    today = datetime.now(BUDAPEST_TZ).date()
+    default_end = (pd.Timestamp(today) + pd.DateOffset(years=1)).date()
+
+    start_date = parse_date_or_default(start, today)
+    end_date = parse_date_or_default(end, default_end)
+
+    return f"{format_merchant_datetime(start_date)}/{format_merchant_datetime(end_date)}"
+
+
+def validate_columns(df: pd.DataFrame) -> None:
+    missing_columns = REQUIRED_COLUMNS - set(df.columns)
+
+    if missing_columns:
+        raise RuntimeError(
+            "Hiányzó oszlopok az UNAS exportból: " + ", ".join(sorted(missing_columns))
+        )
+
+
+def build_feed_dataframe(excel_data: BytesIO, config: Config) -> pd.DataFrame:
     df = pd.read_excel(excel_data)
+    input_row_count = len(df)
 
-    # Szűrés: csak ahol státusz 1 és készlet nem "off"
-    df = df[df["Státusz"] == 1]
-    df = df[df["Raktárkészlet"] != "off"]
+    validate_columns(df)
 
-    # Minimum mennyiség oszlop mentése (alapértelmezett: 1)
+    # Szűrés: csak aktív termékek, és ahol a készlet nem "off".
+    status_numeric = pd.to_numeric(df["Státusz"], errors="coerce").fillna(0).astype(int)
+    stock_as_text = df["Raktárkészlet"].astype(str).str.strip().str.lower()
+
+    df = df[(status_numeric == 1) & (stock_as_text != "off")].copy()
+
+    # Minimum mennyiség oszlop mentése. Ha nincs értelmezhető érték, 1-nek vesszük.
     df["Min. Menny."] = pd.to_numeric(df["Min. Menny."], errors="coerce").fillna(1)
 
-    # Alap árak számmá alakítása
+    # Ármezők normalizálása.
     df["Bruttó Ár"] = pd.to_numeric(df["Bruttó Ár"], errors="coerce").fillna(0)
     df["Akciós Bruttó Ár"] = pd.to_numeric(df["Akciós Bruttó Ár"], errors="coerce").fillna(0)
 
-    # Ha a kapcsoló 1, akkor szorozzuk fel a min. mennyiséggel
-    if MULTIPLY_BY_MIN_QTY == 1:
+    if config.multiply_by_min_qty:
         df["Bruttó Ár"] = df["Bruttó Ár"] * df["Min. Menny."]
         df["Akciós Bruttó Ár"] = df["Akciós Bruttó Ár"] * df["Min. Menny."]
 
-    # Kerekítés / üres akciós ár, ha nincs akció
-    df["Bruttó Ár"] = df["Bruttó Ár"].round(0)
-    df["Akciós Bruttó Ár"] = df["Akciós Bruttó Ár"].apply(lambda x: round(x, 0) if x > 0 else "")
+    df["Bruttó Ár"] = df["Bruttó Ár"].round(0).astype(int)
 
-    # Készlet konverzió
-    df["Raktárkészlet"] = pd.to_numeric(df["Raktárkészlet"], errors="coerce").fillna(0).clip(lower=0).round(0)
+    # A sale_price_effective_date számításhoz még megtartjuk a numerikus akciós árat.
+    df["_Akciós Bruttó Ár Numeric"] = df["Akciós Bruttó Ár"].round(0)
 
-    # Csak a szükséges oszlopok megtartása
-    df = df[[
-        "Cikkszám", "Bruttó Ár", "Akciós Bruttó Ár", "Akció Kezdet", "Akció Lejárat", "Raktárkészlet"
-    ]].copy()
-
-    # Új mezők
-    df["store_code"] = "03343192712828716513"
-    df["availability"] = "in_stock"
-    df["pickup_method"] = "buy"
-    df["pickup_sla"] = "same day"
-
-    # Akciós dátum formázás
-    df["sale_price_effective_date"] = df.apply(
-        lambda row: convert_sale_date(row["Akció Kezdet"], row["Akció Lejárat"], row["Akciós Bruttó Ár"]),
-        axis=1
+    df["Akciós Bruttó Ár"] = df["_Akciós Bruttó Ár Numeric"].apply(
+        lambda value: int(value) if value > 0 else ""
     )
 
-    # Töröljük a dátumoszlopokat
-    df.drop(columns=["Akció Kezdet", "Akció Lejárat"], inplace=True)
+    df["Raktárkészlet"] = (
+        pd.to_numeric(df["Raktárkészlet"], errors="coerce")
+        .fillna(0)
+        .clip(lower=0)
+        .round(0)
+        .astype(int)
+    )
 
-    # Oszlopátnevezés
-    df.rename(columns={
-        "Cikkszám": "id",
-        "Bruttó Ár": "price",
-        "Akciós Bruttó Ár": "sale_price",
-        "Raktárkészlet": "quantity"
-    }, inplace=True)
+    feed_df = df[
+        [
+            "Cikkszám",
+            "Bruttó Ár",
+            "Akciós Bruttó Ár",
+            "Akció Kezdet",
+            "Akció Lejárat",
+            "Raktárkészlet",
+            "_Akciós Bruttó Ár Numeric",
+        ]
+    ].copy()
 
-    # Mentés
-    df.to_excel(os.path.join(base_path, "product_database_raw.xlsx"), index=False)
-    df.to_csv(os.path.join(base_path, "product_database_raw.txt"), sep="\t", index=False)
+    feed_df["store_code"] = config.store_code
 
-    print("Mentve: product_database_raw.xlsx és product_database_raw.txt")
+    # Ezt szándékosan fixen hagyjuk, mert nálatok ez a jelenlegi helyes logika.
+    feed_df["availability"] = "in_stock"
+    feed_df["pickup_method"] = "buy"
+    feed_df["pickup_sla"] = "same day"
 
-def main():
-    token = get_token()
-    download_product_db(token)
+    feed_df["sale_price_effective_date"] = feed_df.apply(
+        lambda row: convert_sale_date(
+            row["Akció Kezdet"],
+            row["Akció Lejárat"],
+            row["_Akciós Bruttó Ár Numeric"],
+        ),
+        axis=1,
+    )
 
-if __name__ == '__main__':
-    main()
+    feed_df.rename(
+        columns={
+            "Cikkszám": "id",
+            "Bruttó Ár": "price",
+            "Akciós Bruttó Ár": "sale_price",
+            "Raktárkészlet": "quantity",
+        },
+        inplace=True,
+    )
+
+    feed_df = feed_df[OUTPUT_COLUMNS]
+
+    logging.info(
+        "UNAS export feldolgozva. Bejövő sorok: %s, feed sorok: %s",
+        input_row_count,
+        len(feed_df),
+    )
+
+    if feed_df.empty:
+        logging.warning("A generált feed üres. Ellenőrizd az UNAS exportot és a szűrési feltételeket.")
+
+    return feed_df
+
+
+def write_outputs(feed_df: pd.DataFrame, config: Config) -> None:
+    txt_path = config.output_dir / config.txt_filename
+
+    feed_df.to_csv(
+        txt_path,
+        sep="\t",
+        index=False,
+        encoding="utf-8",
+        lineterminator="\n",
+    )
+
+    logging.info("TXT feed mentve: %s", txt_path)
+
+    if config.write_debug_xlsx:
+        xlsx_path = config.output_dir / config.xlsx_filename
+        feed_df.to_excel(xlsx_path, index=False)
+        logging.info("Debug XLSX mentve: %s", xlsx_path)
+
+
+def run() -> None:
+    config = load_config()
+    session = build_http_session()
+
+    logging.info("UNAS token lekérése...")
+    token = get_token(session, config)
+
+    logging.info("UNAS termékadatbázis letöltési URL lekérése...")
+    download_url = request_product_db_url(session, token)
+
+    logging.info("UNAS XLSX letöltése...")
+    excel_data = download_excel(session, download_url)
+
+    logging.info("Merchant Center feed generálása...")
+    feed_df = build_feed_dataframe(excel_data, config)
+
+    write_outputs(feed_df, config)
+
+
+def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
+    try:
+        run()
+    except Exception:
+        logging.exception("A feed generálása sikertelen.")
+        return 1
+
+    logging.info("A feed generálása sikeresen befejeződött.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
