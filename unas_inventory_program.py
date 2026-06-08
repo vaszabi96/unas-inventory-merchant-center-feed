@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 import sys
+import time as time_module
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date, datetime, time
@@ -17,9 +19,6 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
-# ────────────────────────────────────────────────────────────────
-# Alapbeállítások
-# ────────────────────────────────────────────────────────────────
 BASE_URL: Final[str] = "https://api.unas.eu/shop"
 LOGIN_URL: Final[str] = f"{BASE_URL}/login"
 PRODUCTDB_URL: Final[str] = f"{BASE_URL}/getProductDB"
@@ -29,6 +28,12 @@ DEFAULT_STORE_CODE: Final[str] = "03343192712828716513"
 DEFAULT_OUTPUT_DIR: Final[str] = "public"
 DEFAULT_TXT_FILENAME: Final[str] = "product_database_raw.txt"
 DEFAULT_XLSX_FILENAME: Final[str] = "product_database_raw.xlsx"
+
+CONNECT_TIMEOUT: Final[int] = 120
+READ_TIMEOUT: Final[int] = 180
+TOKEN_ATTEMPTS: Final[int] = 5
+PRODUCTDB_ATTEMPTS: Final[int] = 5
+DOWNLOAD_ATTEMPTS: Final[int] = 3
 
 REQUIRED_COLUMNS: Final[set[str]] = {
     "Cikkszám",
@@ -66,12 +71,9 @@ class Config:
 
 
 def env_bool(name: str, default: bool = False) -> bool:
-    """Környezeti változó értelmezése logikai értékként."""
     raw_value = os.environ.get(name)
-
     if raw_value is None:
         return default
-
     return raw_value.strip().lower() in {"1", "true", "yes", "y", "igen", "i"}
 
 
@@ -93,24 +95,52 @@ def load_config() -> Config:
     )
 
 
+def log_network_diagnostics() -> None:
+    logging.info("UNAS API diagnosztika indul...")
+
+    try:
+        ip = socket.gethostbyname("api.unas.eu")
+        logging.info("api.unas.eu DNS IP: %s", ip)
+    except Exception as exc:
+        logging.warning("DNS feloldás sikertelen api.unas.eu esetén: %s", exc)
+
+    try:
+        response = requests.get(
+            "https://api.ipify.org",
+            timeout=(10, 20),
+        )
+        logging.info("GitHub runner publikus IP: %s", response.text.strip())
+    except Exception as exc:
+        logging.warning("Runner publikus IP lekérése sikertelen: %s", exc)
+
+
 def build_http_session() -> requests.Session:
-    """HTTP kliens automatikus újrapróbálással átmeneti hibákra."""
     retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        status=3,
-        backoff_factor=2,
-        status_forcelist=(429, 500, 502, 503, 504),
+        total=5,
+        connect=5,
+        read=5,
+        status=5,
+        backoff_factor=3,
+        status_forcelist=(408, 425, 429, 500, 502, 503, 504),
         allowed_methods=frozenset({"GET", "POST"}),
         raise_on_status=False,
+        respect_retry_after_header=True,
     )
 
-    adapter = HTTPAdapter(max_retries=retry)
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=10,
+        pool_maxsize=10,
+    )
 
     session = requests.Session()
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+    session.headers.update(
+        {
+            "User-Agent": "Buildox-UNAS-Merchant-Feed/1.0",
+        }
+    )
     return session
 
 
@@ -118,12 +148,18 @@ def parse_xml_field(xml_content: bytes, field_name: str, context: str) -> str:
     try:
         root = ET.fromstring(xml_content)
     except ET.ParseError as exc:
-        raise RuntimeError(f"{context}: az UNAS válasza nem érvényes XML.") from exc
+        body_preview = xml_content[:800].decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"{context}: az UNAS válasza nem érvényes XML. response={body_preview}"
+        ) from exc
 
     value = root.findtext(field_name)
 
     if not value:
-        raise RuntimeError(f"{context}: hiányzik a <{field_name}> mező az UNAS válaszból.")
+        body_preview = xml_content[:800].decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"{context}: hiányzik a <{field_name}> mező az UNAS válaszból. response={body_preview}"
+        )
 
     return value.strip()
 
@@ -136,6 +172,56 @@ def raise_for_status_with_body(response: requests.Response, context: str) -> Non
         raise RuntimeError(
             f"{context}: HTTP hiba. status={response.status_code}, response={body_preview}"
         ) from exc
+
+
+def request_with_manual_retry(
+    session: requests.Session,
+    method: str,
+    url: str,
+    *,
+    context: str,
+    attempts: int,
+    **kwargs,
+) -> requests.Response:
+    last_exc: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            logging.info("%s: próbálkozás %s/%s", context, attempt, attempts)
+
+            response = session.request(
+                method=method,
+                url=url,
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                **kwargs,
+            )
+
+            logging.info(
+                "%s: válasz érkezett. status=%s, bytes=%s",
+                context,
+                response.status_code,
+                len(response.content or b""),
+            )
+
+            return response
+
+        except (
+            requests.exceptions.ConnectTimeout,
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectionError,
+        ) as exc:
+            last_exc = exc
+            logging.warning("%s: kapcsolódási hiba: %s", context, exc)
+
+            if attempt < attempts:
+                sleep_seconds = min(30 * attempt, 120)
+                logging.info("%s: várakozás újrapróbálás előtt: %s mp", context, sleep_seconds)
+                time_module.sleep(sleep_seconds)
+
+    raise RuntimeError(
+        f"{context}: nem sikerült kapcsolódni az UNAS API-hoz {attempts} próbálkozás után. "
+        f"Ez valószínűleg UNAS API elérhetőségi, tűzfal, IP-szűrés vagy GitHub runner hálózati probléma."
+    ) from last_exc
 
 
 def get_token(session: requests.Session, config: Config) -> str:
@@ -151,11 +237,14 @@ def get_token(session: requests.Session, config: Config) -> str:
         "Accept": "application/xml",
     }
 
-    response = session.post(
+    response = request_with_manual_retry(
+        session,
+        "POST",
         LOGIN_URL,
+        context="UNAS login token lekérése",
+        attempts=TOKEN_ATTEMPTS,
         data=xml.encode("utf-8"),
         headers=headers,
-        timeout=60,
     )
 
     raise_for_status_with_body(response, "UNAS login")
@@ -181,11 +270,14 @@ def request_product_db_url(session: requests.Session, token: str) -> str:
         "Authorization": f"Bearer {token}",
     }
 
-    response = session.post(
+    response = request_with_manual_retry(
+        session,
+        "POST",
         PRODUCTDB_URL,
+        context="UNAS termékadatbázis URL lekérése",
+        attempts=PRODUCTDB_ATTEMPTS,
         data=xml.encode("utf-8"),
         headers=headers,
-        timeout=60,
     )
 
     raise_for_status_with_body(response, "UNAS termékadatbázis URL lekérése")
@@ -193,7 +285,14 @@ def request_product_db_url(session: requests.Session, token: str) -> str:
 
 
 def download_excel(session: requests.Session, download_url: str) -> BytesIO:
-    response = session.get(download_url, timeout=180)
+    response = request_with_manual_retry(
+        session,
+        "GET",
+        download_url,
+        context="UNAS XLSX letöltése",
+        attempts=DOWNLOAD_ATTEMPTS,
+    )
+
     raise_for_status_with_body(response, "UNAS XLSX letöltése")
 
     if not response.content:
@@ -249,16 +348,13 @@ def build_feed_dataframe(excel_data: BytesIO, config: Config) -> pd.DataFrame:
 
     validate_columns(df)
 
-    # Szűrés: csak aktív termékek, és ahol a készlet nem "off".
     status_numeric = pd.to_numeric(df["Státusz"], errors="coerce").fillna(0).astype(int)
     stock_as_text = df["Raktárkészlet"].astype(str).str.strip().str.lower()
 
     df = df[(status_numeric == 1) & (stock_as_text != "off")].copy()
 
-    # Minimum mennyiség oszlop mentése. Ha nincs értelmezhető érték, 1-nek vesszük.
     df["Min. Menny."] = pd.to_numeric(df["Min. Menny."], errors="coerce").fillna(1)
 
-    # Ármezők normalizálása.
     df["Bruttó Ár"] = pd.to_numeric(df["Bruttó Ár"], errors="coerce").fillna(0)
     df["Akciós Bruttó Ár"] = pd.to_numeric(df["Akciós Bruttó Ár"], errors="coerce").fillna(0)
 
@@ -268,7 +364,6 @@ def build_feed_dataframe(excel_data: BytesIO, config: Config) -> pd.DataFrame:
 
     df["Bruttó Ár"] = df["Bruttó Ár"].round(0).astype(int)
 
-    # A sale_price_effective_date számításhoz még megtartjuk a numerikus akciós árat.
     df["_Akciós Bruttó Ár Numeric"] = df["Akciós Bruttó Ár"].round(0)
 
     df["Akciós Bruttó Ár"] = df["_Akciós Bruttó Ár Numeric"].apply(
@@ -296,8 +391,6 @@ def build_feed_dataframe(excel_data: BytesIO, config: Config) -> pd.DataFrame:
     ].copy()
 
     feed_df["store_code"] = config.store_code
-
-    # Ezt szándékosan fixen hagyjuk, mert nálatok ez a jelenlegi helyes logika.
     feed_df["availability"] = "in_stock"
     feed_df["pickup_method"] = "buy"
     feed_df["pickup_sla"] = "same day"
@@ -357,6 +450,8 @@ def write_outputs(feed_df: pd.DataFrame, config: Config) -> None:
 def run() -> None:
     config = load_config()
     session = build_http_session()
+
+    log_network_diagnostics()
 
     logging.info("UNAS token lekérése...")
     token = get_token(session, config)
