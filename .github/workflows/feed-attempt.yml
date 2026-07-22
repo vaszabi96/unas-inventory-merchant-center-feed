@@ -1,0 +1,64 @@
+name: UNAS feed attempt
+
+on:
+  workflow_call:
+    inputs:
+      artifact_name:
+        description: A sikeres feed artifact egyedi neve
+        required: true
+        type: string
+    secrets:
+      UNAS_API_KEY:
+        required: true
+      GOOGLE_STORE_CODE:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    name: Feed generálása
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Python beállítása
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Python csomagok telepítése
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Feed generálása UNAS-ból
+        env:
+          UNAS_API_KEY: ${{ secrets.UNAS_API_KEY }}
+          OUTPUT_DIR: public
+          GOOGLE_STORE_CODE: ${{ secrets.GOOGLE_STORE_CODE }}
+          MULTIPLY_BY_MIN_QTY: "false"
+          WRITE_DEBUG_XLSX: "false"
+        run: python unas_inventory_program.py
+
+      - name: Egyszerű index.html létrehozása
+        shell: bash
+        run: |
+          cat > public/index.html <<'HTML'
+          <!doctype html>
+          <html lang="hu">
+          <head><meta charset="utf-8"><title>UNAS Merchant Feed</title></head>
+          <body><h1>UNAS Merchant Feed</h1><p><a href="product_database_raw.txt">product_database_raw.txt</a></p></body>
+          </html>
+          HTML
+
+      - name: Sikeres feed ideiglenes feltöltése
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: public
+          if-no-files-found: error
+          retention-days: 1

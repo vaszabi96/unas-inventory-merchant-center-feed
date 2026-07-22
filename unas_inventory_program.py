@@ -29,11 +29,14 @@ DEFAULT_OUTPUT_DIR: Final[str] = "public"
 DEFAULT_TXT_FILENAME: Final[str] = "product_database_raw.txt"
 DEFAULT_XLSX_FILENAME: Final[str] = "product_database_raw.xlsx"
 
-CONNECT_TIMEOUT: Final[int] = 120
-READ_TIMEOUT: Final[int] = 180
-TOKEN_ATTEMPTS: Final[int] = 5
-PRODUCTDB_ATTEMPTS: Final[int] = 5
-DOWNLOAD_ATTEMPTS: Final[int] = 3
+# A blokkolt GitHub runner IP-ket gyorsan fel kell ismerni. Az új kimenő IP-t
+# a workflow külön jobban, új runneren próbálja meg, ezért itt nem érdemes egy
+# órán át ugyanarról az IP-ről újrakapcsolódni.
+CONNECT_TIMEOUT: Final[int] = 15
+READ_TIMEOUT: Final[int] = 120
+TOKEN_ATTEMPTS: Final[int] = 1
+PRODUCTDB_ATTEMPTS: Final[int] = 2
+DOWNLOAD_ATTEMPTS: Final[int] = 2
 
 REQUIRED_COLUMNS: Final[set[str]] = {
     "Cikkszám",
@@ -116,11 +119,13 @@ def log_network_diagnostics() -> None:
 
 def build_http_session() -> requests.Session:
     retry = Retry(
-        total=5,
-        connect=5,
-        read=5,
-        status=5,
-        backoff_factor=3,
+        total=2,
+        # A connect timeout jellemzően az adott runner IP-jének blokkolását
+        # jelenti. Ugyanarról az IP-ről ne ismételjük automatikusan.
+        connect=0,
+        read=2,
+        status=2,
+        backoff_factor=2,
         status_forcelist=(408, 425, 429, 500, 502, 503, 504),
         allowed_methods=frozenset({"GET", "POST"}),
         raise_on_status=False,
