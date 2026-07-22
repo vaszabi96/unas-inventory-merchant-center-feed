@@ -1,6 +1,13 @@
 name: Update Feed
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - unas_inventory_program.py
+      - requirements.txt
+      - .github/workflows/update-feed.yml
+      - .github/workflows/feed-attempt.yml
   schedule:
     # Magyar nyári idő szerint kb. 12:17
     # GitHub cron UTC-ben működik.
