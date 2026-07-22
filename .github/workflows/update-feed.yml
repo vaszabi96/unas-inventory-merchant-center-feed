@@ -36,7 +36,7 @@ jobs:
   attempt_2:
     name: UNAS kísérlet 2/3, új runner IP
     needs: attempt_1
-    if: ${{ always() && needs.attempt_1.result == 'failure' }}
+    if: ${{ always() && needs.attempt_1.outputs.feed_ready != 'true' }}
     uses: ./.github/workflows/feed-attempt.yml
     with:
       artifact_name: feed-attempt-2
@@ -46,8 +46,12 @@ jobs:
 
   attempt_3:
     name: UNAS kísérlet 3/3, új runner IP
-    needs: attempt_2
-    if: ${{ always() && needs.attempt_2.result == 'failure' }}
+    needs: [attempt_1, attempt_2]
+    if: >-
+      ${{ always() &&
+        needs.attempt_1.outputs.feed_ready != 'true' &&
+        needs.attempt_2.outputs.feed_ready != 'true'
+      }}
     uses: ./.github/workflows/feed-attempt.yml
     with:
       artifact_name: feed-attempt-3
@@ -58,31 +62,38 @@ jobs:
   package:
     name: Sikeres feed előkészítése
     needs: [attempt_1, attempt_2, attempt_3]
-    if: >-
-      ${{ always() && (
-        needs.attempt_1.result == 'success' ||
-        needs.attempt_2.result == 'success' ||
-        needs.attempt_3.result == 'success'
-      ) }}
+    if: ${{ always() }}
     runs-on: ubuntu-latest
 
     steps:
+      - name: Legalább egy sikeres feed ellenőrzése
+        if: >-
+          ${{
+            needs.attempt_1.outputs.feed_ready != 'true' &&
+            needs.attempt_2.outputs.feed_ready != 'true' &&
+            needs.attempt_3.outputs.feed_ready != 'true'
+          }}
+        shell: bash
+        run: |
+          echo "Mindhárom külön runner IP-ről sikertelen volt az UNAS API elérése."
+          exit 1
+
       - name: Első kísérlet feedjének letöltése
-        if: ${{ needs.attempt_1.result == 'success' }}
+        if: ${{ needs.attempt_1.outputs.feed_ready == 'true' }}
         uses: actions/download-artifact@v4
         with:
           name: feed-attempt-1
           path: public
 
       - name: Második kísérlet feedjének letöltése
-        if: ${{ needs.attempt_2.result == 'success' }}
+        if: ${{ needs.attempt_2.outputs.feed_ready == 'true' }}
         uses: actions/download-artifact@v4
         with:
           name: feed-attempt-2
           path: public
 
       - name: Harmadik kísérlet feedjének letöltése
-        if: ${{ needs.attempt_3.result == 'success' }}
+        if: ${{ needs.attempt_3.outputs.feed_ready == 'true' }}
         uses: actions/download-artifact@v4
         with:
           name: feed-attempt-3
@@ -95,6 +106,7 @@ jobs:
 
   deploy:
     needs: package
+    if: ${{ always() && needs.package.result == 'success' }}
     runs-on: ubuntu-latest
 
     environment:
