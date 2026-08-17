@@ -48,7 +48,7 @@ jobs:
           UNAS_API_KEY: ${{ secrets.UNAS_API_KEY }}
           OUTPUT_DIR: public
           GOOGLE_STORE_CODE: ${{ secrets.GOOGLE_STORE_CODE }}
-          MULTIPLY_BY_MIN_QTY: "false"
+          MULTIPLY_BY_MIN_QTY: "true"
           WRITE_DEBUG_XLSX: "false"
         run: python unas_inventory_program.py
 
