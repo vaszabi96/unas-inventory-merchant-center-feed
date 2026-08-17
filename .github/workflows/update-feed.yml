@@ -8,10 +8,12 @@ on:
       - requirements.txt
       - .github/workflows/update-feed.yml
       - .github/workflows/feed-attempt.yml
+
   schedule:
-  # Magyar nyári idő szerint kb. 05:17
-  # GitHub cron UTC-ben működik.
-  - cron: "17 3 * * *"
+    # Magyar nyári idő szerint kb. 05:17
+    # GitHub cron UTC-ben működik.
+    - cron: "17 3 * * *"
+
   workflow_dispatch:
 
 permissions:
