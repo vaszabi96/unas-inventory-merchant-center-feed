@@ -354,9 +354,10 @@ def build_feed_dataframe(excel_data: BytesIO, config: Config) -> pd.DataFrame:
     validate_columns(df)
 
     status_numeric = pd.to_numeric(df["Státusz"], errors="coerce").fillna(0).astype(int)
-    stock_as_text = df["Raktárkészlet"].astype(str).str.strip().str.lower()
 
-    df = df[(status_numeric == 1) & (stock_as_text != "off")].copy()
+    # Minden aktív termék bekerül a local inventory feedbe, akkor is,
+    # ha az UNAS Raktárkészlet mezője "off".
+    df = df[status_numeric == 1].copy()
 
     df["Min. Menny."] = pd.to_numeric(df["Min. Menny."], errors="coerce").fillna(1)
 
