@@ -41,7 +41,7 @@ A fő Python script. Feladatai:
 1. bejelentkezik az UNAS API-ba;
 2. lekéri az UNAS termékadatbázist XLSX formátumban;
 3. Pandas-szal feldolgozza az adatokat;
-4. kiszűri az inaktív termékeket és az `off` készletű sorokat;
+4. kiszűri az inaktív termékeket; minden aktív termék bekerül, az `off` készletű sorok is;
 5. előállítja a Google Merchant Centerhez használt TXT feedet;
 6. elmenti a fájlt a `public/product_database_raw.txt` útvonalra.
 
@@ -196,12 +196,14 @@ A Merchant Centernek közvetlenül a TXT fájl URL-jét kell megadni, nem a repo
 
 ## Fontos működési logika
 
-A script csak azokat a termékeket tartja meg, amelyeknél:
+A script minden aktív terméket megtart:
 
 ```text
 Státusz = 1
-Raktárkészlet != off
 ```
+
+Az UNAS-ban `Raktárkészlet = off` értékű aktív termékek is bekerülnek a feedbe.
+Minden exportált aktív terméknél az `availability` értéke fixen `in_stock`.
 
 A készletet számmá alakítja, negatív készlet esetén 0-ra vágja, majd egész számra kerekíti.
 
